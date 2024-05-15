@@ -1,0 +1,382 @@
+---
+title: "Rent"
+author: "Brandon Stoia"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+knitr:
+  opts_chunk: 
+    warning: false
+    message: false
+format:
+  html:
+    toc: true
+    toc-location: right
+    toc-title: "Table of Contents"
+    number-sections: true
+    code-fold: true
+    fig-asp: 0.618
+    fig-width: 7
+    fig-cap-location: top
+    embed-resources: true
+theme: flatly
+---
+
+
+```{r, include=F, output=F}
+## load libs
+
+library(tidyverse)
+library(ggplot2)
+library(caret)
+library(tidycensus)
+library(car)
+library(kableExtra)
+library(httr)
+library(readxlsb)
+library(rvest)
+library(openxlsx)
+
+## change wd if needed 
+#setwd("/Users/brandonstoia/Desktop/Spring 24/STA467/Final Project/")
+#getwd()
+
+## load census api key
+#census_api_key("abfff9ed3562482d206c8477e87b8acbf08435a8", install=T)
+
+`%nin%` = Negate(`%in%`)
+
+## list of vars in variables in get_acs()
+v22 <- load_variables(2022, "acs5", cache=T)
+
+## fips codes for geographies
+data("fips_codes")
+```
+
+
+# Intro
+
+Hi there. My name's Brandon and I'm about to graduate college. I've secured a full time role after my graduation, and will be making a salary competitive to others in the industry. I'm quite fortunate to have been blessed with the opportunities that have come my way, which did not come easy: I attribute these blessings to the investments that my parents have made in me, their support and involvement in my life. Of course other factors that exist outside of this that have benefited me, disadvantaged me, or not affected me at all. But why did I graduate when the current state of lodging in the United States is so *awful*? I mean... I'll see microapartments in NYC that are 20 square feet going with rent costing $2k a month! The cost to live has arguably increased much faster than the money we earn to live, yet the higher classes flaunt their wealth obscenely and even destroy the process in doing so. This entire existential crisis eats me up at night because I just want to move to an urban, walkable city with my dog Kaya and be in a gay group of friends that I've lacked all throughout high school and college but cities are expensive, even for me, and I consider myself extremely lucky and well off. Going to college highlighted this for me, as I had friends who had to drop out because they couldn't afford to continue their education, and I've met people with millions of dollars in inheritance. All this to say, I want to investigate what contributes to rent prices, and perhaps find a model to explain some of the relationships between county characteristics and their median rent prices. 
+
+
+# Data
+
+For this exploration, I've decided to look into a number of factors. I'm going to leave this as a work in progress section because I'd like to continue exploring this and adding new data, updating data that may be outdated, etc. 
+
+## American Community Survey (ACS)
+
+The main dataset I'll be analyzing is the 2022 American Community Survey (ACS), which is a yearly survey conducted by the US Census Bureau. I'll be using the 5-year-estimates of the ACS survey, which pools together the last five years of data (2018-2022) due to the inability to infer 1-year estimates for geographic areas with small populations. From the ACS, I'll be investigating a number of variables, but all in an effort to explain the **median rent** with the goal of creating a model that accurately predicts rent, or a model that  makes significant inference about the factors contributing to the median rent. 
+
+```{r}
+vars <- v22 %>%
+  filter(
+    name %in% c(
+      "B01003_001",
+      "B25002_003",
+      "B25001_001",
+      "B19013_001",
+      "B25058_001",
+      "B23025_005",
+      "B25003_002",
+      "B25003_003",
+      "B15003_022",
+      "B08131_001",
+      "B08301_001",
+      "B992701_001",
+      "B99172_001",
+      "B29003_001",
+      "B25034",
+      "B25034_001"
+    )
+  )
+
+vars %>% select(Field=name, Description=concept) %>% kable(format = "markdown")
+```
+
+```{r}
+acs <- get_acs(
+  geography = "county",
+  variables = c(total_pop = "B01003_001",
+                vacant_houses = "B25002_003",
+                housing_units = "B25001_001",
+                median_income = "B19013_001",
+                median_rent = "B25058_001",
+                unemployed = "B23025_005",
+                owner_occupied = "B25003_002",
+                renter_occupied = "B25003_003",
+                bach_degree = "B15003_022",
+                travel_time_to_work = "B08131_001",
+                means_of_transport ="B08301_001",
+                health_insurance_coverage ="B992701_001",
+                poverty_status_for_families = "B99172_001",
+                poverty_status="B29003_001"
+                #housing_built = "B25034_001"
+  ),
+  year=2022,
+  survey="acs5"
+) %>% 
+  pivot_wider(names_from = variable, values_from = estimate, id_cols = c(GEOID, NAME))
+```
+
+
+## EPA Walkability 
+
+```{r, cache=T}
+options(timeout = 200)
+epa <- read.csv("http://edg.epa.gov/EPADataCommons/public/OA/EPA_SmartLocationDatabase_V3_Jan_2021_Final.csv") %>% select(c("STATEFP", "COUNTYFP", "CSA", "CSA_Name", "CBSA", "CBSA_Name", "CBSA_POP", "TotPop", "Ac_Total", "Ac_Land", "Ac_Water", "Ac_Unpr", "CountHU", "HH", "NatWalkInd", "Shape_Length", "Shape_Area")) %>% 
+  mutate(STATEFP = as.character(sprintf("%02d", STATEFP)),
+         COUNTYFP = as.character(sprintf("%03d", COUNTYFP))) %>% left_join(fips_codes, by = c("STATEFP" = "state_code", "COUNTYFP" = "county_code")) %>% 
+  mutate(GEOID = paste0(STATEFP, COUNTYFP)) 
+```
+
+
+
+```{r,cache=T}
+epa <- epa %>%
+  select(GEOID, state, county, TotPop, Ac_Total, Ac_Land, Ac_Water, Ac_Unpr, CountHU, HH, NatWalkInd) %>%
+  group_by(GEOID, state, county) %>%
+  #nest(NatWalkData = NatWalkInd) %>%
+  summarize(
+    sumPop = sum(TotPop),
+    Ac_Total = sum(Ac_Total),
+    Ac_Land = sum(Ac_Land),
+    Ac_Water = sum(Ac_Water),
+    Ac_Unp = sum(Ac_Unpr),
+    CountHU = sum(CountHU), 
+    HH = sum(HH),
+    numblocks = length(NatWalkInd),
+    max_walkable = max(NatWalkInd),
+    mean_walkable = mean(NatWalkInd),
+    median_walkable = median(NatWalkInd),
+    .groups = "drop"
+  ) %>% left_join(
+    epa %>%
+      select(GEOID, state, county, NatWalkInd) %>%
+      group_by(GEOID, state, county) %>%
+      nest(NatWalkData = NatWalkInd),
+    by = c("GEOID", "state", "county")
+  ) #%>% 
+  #left_join(acs, by="GEOID")
+```
+
+
+```{r}
+acs %>% 
+  filter(GEOID %nin% epa$GEOID) 
+### 11/3222 counties in acs with no walkability info in epa
+```
+
+
+```{r}
+epa %>% 
+  filter(GEOID %nin% acs$GEOID) 
+## 22/3233 counties in epa not available in acs
+
+sum(is.na(acs$median_rent))
+# 10 counties in acs have median rent data
+```
+
+```{r}
+acs %>% filter(is.na(median_rent))
+```
+
+
+## HUD Homelessness Point-In-Time Estimates (Work in Progress)
+
+In thinking about housing in general, one must consider those who don't have access to housing, or are barred by financial or health circumstances. Thus, I wanted to incorporate estimates of homelessness into this investigation.
+
+```{r, eval =F}
+hudurl <- "https://www.huduser.gov/portal/sites/default/files/xls/2007-2023-PIT-Counts-by-CoC.xlsb"
+destfile <- "PIT-Counts-by-CoC.xlsb"
+GET(hudurl, write_disk(destfile, overwrite = TRUE))
+
+
+extract_counties <- function(coc) {
+  counties <- NA
+  if (str_detect(coc, "County CoC|Counties CoC")) {
+    counties <- str_extract(coc, ".*(?= County CoC)|.*(?= Counties CoC)")
+    counties <- str_split(counties, "/|, | - | & | and ") %>% unlist() %>% str_trim()
+    counties <- str_replace(counties, "City &", "")
+  } else if (str_detect(coc, "&")) {
+    counties <- str_split(coc, "&") %>% unlist() %>% str_trim()
+  }
+  return(counties)
+}
+
+# Read the xlsb file
+hud <- read_xlsb(destfile, sheet = "2023") %>% 
+  mutate(
+    state = substr(CoC.Number, 1, 2),
+    county = sapply(CoC.Name, extract_counties)
+  ) %>% 
+  select(c("state", "county", num="CoC.Number", coc = "CoC.Name", cat = "CoC.Category", 
+           counttype ="Count.Types", "Overall.Homeless", "Overall.Homeless...Under.18")) %>% 
+  filter(state %nin% c("", "a ", "* "))
+
+```
+
+
+## Prison Policy Initiative Incarceration Estimates
+
+Along the lines mentioned previously, one also must consider those who have restricted access to housing, whether it be in the form of incarceration at a facility or house arrest and limitations. I also wanted to incorporate this aspect of housing into the estimation.
+
+```{r}
+ppi <- read_html("https://www.prisonpolicy.org/racialgeography/counties.html") %>% 
+  html_element(css = "#dantable") %>% 
+  html_table() %>% 
+  mutate(
+    NAME = paste0(County, ", ", State)
+  ) %>% 
+  select(NAME, "Total Population", "Incarcerated Population", 
+         "Ratio of Overrepresentation of Whites Incarcerated Compared to Whites Non-Incarcerated",
+         "Ratio of Overrepresentation of Blacks Incarcerated Compared to Blacks Non-Incarcerated",
+         "Ratio of Overrepresentation of Latinos Incarcerated Compared to Latinos Non-Incarcerated")
+```
+
+
+## NCES Literacy and Numeracy scores
+
+Finally, I believe that literacy and numeracy will give insight into financial responsibility, and it would be interesting to see how these compare to rent prices.
+
+```{r}
+options(timeout = 300)
+nces <- read.xlsx("https://nces.ed.gov/surveys/piaac/skillsmap/static/media/SAE_website_dataset.c15d59a2d7e219fcb6d1.xlsx") %>% 
+  filter(grpName == "all") %>% 
+  mutate(GEOID = as.character(sprintf("%05d", FIPS_code))) %>% 
+  select(GEOID, Lit_A, Num_A, POP)
+```
+
+
+
+
+
+
+## Wrangling
+
+Ideally I'd like to have county-level data.
+
+```{r}
+rent <- acs %>% 
+  left_join(epa, by="GEOID") %>% 
+  left_join(ppi, by="NAME") %>% 
+  left_join(nces, by="GEOID") %>% 
+  mutate(incarcerated = as.numeric(str_replace(`Incarcerated Population`, ",", ""))) %>% 
+  select(c(
+    GEOID,
+    state,
+    county,
+    NAME,
+    median_rent,
+    total_pop, 
+    bach_degree,
+    median_income,
+    unemployed,
+    housing_units,
+    vacant_houses,
+    owner_occupied,
+    renter_occupied,
+    poverty_status,
+    poverty_status_for_families,
+    health_insurance_coverage,
+    Ac_Total,
+    Ac_Land,
+    Ac_Water,
+    Ac_Unp, 
+    max_walkable,
+    mean_walkable, 
+    median_walkable,
+    incarcerated, #= `Incarcerated Population`,
+    literacy =Lit_A,
+    numeracy = Num_A
+  ))
+```
+
+```{r}
+summary(rent)
+# we have 80 missing values in some counties, so they will be dropped :(
+```
+
+```{r}
+# lose 104/3222 counties due to missing data
+rentn <- na.omit(rent)
+```
+
+
+
+
+# EDA
+
+```{r}
+hist(log(rentn$total_pop))
+
+hist(log(rentn$bach_degree))
+
+hist(rentn$median_income)
+
+hist(log(rentn$unemployed))
+
+
+hist(rentn$median_rent)
+
+hist(log(rentn$poverty_status))
+
+hist(log(rentn$Ac_Land))
+
+hist(log(rentn$Ac_Water))
+
+hist(log(rentn$Ac_Unp))
+
+hist(rentn$max_walkable)
+
+hist(log(rentn$vacant_houses))
+```
+
+
+
+```{r}
+
+ggplot() +
+  geom_point(aes(x=total_pop, y=median_rent), data=rentn)
+
+ggplot() +
+  geom_point(aes(x=bach_degree, y=median_rent), data=rentn)
+
+
+ggplot() +
+  geom_point(aes(x=median_income, y=median_rent), data=rentn)
+
+ggplot() +
+  geom_point(aes(x=unemployed, y=median_rent), data=rentn)
+
+
+ggplot() +
+  geom_point(aes(x=renter_occupied/(renter_occupied+owner_occupied), y=median_rent), data=rentn)
+
+ggplot() +
+  geom_point(aes(x=incarcerated, y=median_rent), data=rentn)
+
+ggplot() +
+  geom_point(aes(x=poverty_status, y=median_rent), data=rentn)
+
+
+ggplot() +
+  geom_point(aes(x=Ac_Land, y=median_rent), data=rentn)
+
+ggplot() +
+  geom_point(aes(x=Ac_Water, y=median_rent), data=rentn)
+
+ggplot() +
+  geom_point(aes(x=Ac_Unp, y=median_rent), data=rentn)
+
+ggplot() +
+  geom_point(aes(x=literacy, y=median_rent), data=rentn)
+
+ggplot() +
+  geom_point(aes(x=numeracy, y=median_rent), data=rentn)
+```
+
+
+```{r}
+write_csv(rentn, "rent.csv")
+```
+
+
+
